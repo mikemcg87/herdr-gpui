@@ -30,6 +30,12 @@ pub const RELEASES_PAGE: &str = "https://github.com/penso/herdr-gpui/releases";
 const LATEST_URL: &str = "https://api.github.com/repos/penso/herdr-gpui/releases/latest";
 /// The newest published releases of both kinds, for the beta channel.
 const RELEASES_URL: &str = "https://api.github.com/repos/penso/herdr-gpui/releases?per_page=10";
+/// The listing the grouped notes are read from. Wider than the beta listing,
+/// because a history can span more releases than the newest ten.
+const HISTORY_URL: &str = "https://api.github.com/repos/penso/herdr-gpui/releases?per_page=30";
+/// A user months behind is dozens of releases back; past this the grouped list
+/// stops being readable long before it stops growing.
+const MAX_GROUPED_RELEASES: usize = 20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -409,6 +415,64 @@ fn parse_releases(bytes: &[u8]) -> Result<Release> {
     validate_release(newest, UpdateChannel::Beta)
 }
 
+/// The notes for every release between the installed version and the target,
+/// newest first, each under its own heading: what a user several versions
+/// behind is actually getting, rather than only the newest release's notes.
+///
+/// `None` when there is nothing to group — fewer than two releases carry notes,
+/// which is the ordinary single-release update, and the caller falls back to the
+/// target's own body. Notes are display-only and untrusted; they are parsed as
+/// text and never interpreted.
+fn history_notes(
+    metadata: &[u8],
+    current: (u64, u64),
+    target: &str,
+    target_body: Option<&str>,
+    channel: UpdateChannel,
+) -> Result<Option<String>> {
+    if metadata.len() > RELEASE_LIST_LIMIT {
+        return Err(Error::MetadataLimit);
+    }
+    let target_version = parse_version(target).ok_or(Error::ReleaseVersion)?;
+    let releases: Vec<Release> = serde_json::from_slice(metadata).map_err(Error::ReleaseJson)?;
+    let mut shown: Vec<((u64, u64), String, String)> = releases
+        .into_iter()
+        .filter(|release| !release.draft)
+        // A stable installation never included a prerelease, so its notes are
+        // not part of what this user is being offered.
+        .filter(|release| channel == UpdateChannel::Beta || !release.prerelease)
+        .filter_map(|release| {
+            let version = parse_version(release.version.strip_prefix('v')?)?;
+            let body = release.body.unwrap_or_default();
+            let body = body.trim();
+            // The target is added explicitly below, from the release the
+            // signature actually covers, so it is excluded here.
+            (version > current && version < target_version && !body.is_empty()).then(|| {
+                (
+                    version,
+                    release.version.trim_start_matches('v').to_owned(),
+                    body.to_owned(),
+                )
+            })
+        })
+        .collect();
+    shown.sort_by_key(|(version, _, _)| std::cmp::Reverse(*version));
+    if let Some(body) = target_body.map(str::trim).filter(|body| !body.is_empty()) {
+        shown.insert(0, (target_version, target.to_owned(), body.to_owned()));
+    }
+    shown.truncate(MAX_GROUPED_RELEASES);
+    if shown.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(
+        shown
+            .into_iter()
+            .map(|(_, version, body)| format!("## {version}\n\n{body}"))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    ))
+}
+
 fn validate_release(mut release: Release, channel: UpdateChannel) -> Result<Release> {
     let version = release
         .version
@@ -541,12 +605,30 @@ fn check_with(
         return Err(Error::ArchiveMetadata);
     }
     cancelled(cancel)?;
+    // The grouped history is a nicety, so a listing that cannot be read — a
+    // rate limit, a network blip, a body we did not expect — must never fail the
+    // update: fall back to the target release's own notes.
+    let notes = fetch(HISTORY_URL, RELEASE_LIST_LIMIT)
+        .ok()
+        .and_then(|listing| {
+            history_notes(
+                &listing,
+                current,
+                &release.version,
+                release.body.as_deref(),
+                channel,
+            )
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_else(|| release.body.clone().unwrap_or_default());
+    cancelled(cancel)?;
     Ok(Some(Offer {
         manifest,
         asset,
         manifest_bytes,
         signature,
-        notes: release.body.unwrap_or_default(),
+        notes,
     }))
 }
 
