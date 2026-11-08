@@ -49,7 +49,60 @@ static ENGLISH: LazyLock<Option<Catalog>> = LazyLock::new(|| Catalog::english(FI
 /// `id` in the current locale. Only `fl!` names a message by literal, so
 /// its ID is checked; [`message`] takes one chosen at run time.
 pub(crate) fn text(id: &'static str, args: &[(&str, FluentValue<'_>)]) -> String {
-    message(id, args)
+    if !args.is_empty() {
+        return message(id, args);
+    }
+    STATIC_MESSAGES.with_borrow_mut(|cache| cache.get_or_insert_with(Static::default).get(id))
+}
+
+thread_local! {
+    /// Messages that take no arguments, formatted once per catalog. The window
+    /// asks for the same static text dozens of times a tick, and formatting it
+    /// through Fluent each time is work the locale cannot have changed since
+    /// the last ask. Kept per thread so no lock guards the common path.
+    static STATIC_MESSAGES: std::cell::RefCell<Option<Static>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// What [`text`] keeps for one catalog: the generation it belongs to, and the
+/// messages already formatted for it.
+#[derive(Default)]
+struct Static {
+    /// `u64::MAX` until the first ask, which clears nothing.
+    generation: u64,
+    by_id: std::collections::HashMap<&'static str, String>,
+}
+
+impl Static {
+    fn get(&mut self, id: &'static str) -> String {
+        let generation = current::generation();
+        if self.generation != generation {
+            self.generation = generation;
+            self.by_id.clear();
+        }
+        self.by_id
+            .entry(id)
+            .or_insert_with(|| {
+                #[cfg(test)]
+                FORMATTED.with(|count| count.set(count.get() + 1));
+                message(id, &[])
+            })
+            .clone()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Static messages formatted on this thread, so a test can tell a kept copy
+    /// from the catalog and fail if the cache stops answering.
+    static FORMATTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many static messages this thread has formatted, for the test that a
+/// repeat does not reach the catalog.
+#[cfg(test)]
+pub(crate) fn formatted() -> u64 {
+    FORMATTED.with(std::cell::Cell::get)
 }
 
 /// A message whose ID is data, such as a catalog command's. Tests check
