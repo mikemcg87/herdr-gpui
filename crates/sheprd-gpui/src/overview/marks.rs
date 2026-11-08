@@ -15,6 +15,7 @@ use crate::state_file;
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, hash_map::Entry},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -271,15 +272,39 @@ impl Marks {
         rows: impl IntoIterator<Item = (&'a Key, State)>,
         now: SystemTime,
     ) -> bool {
-        let mut changed = false;
+        // Nothing marked, nothing to release. Most windows, most of the time:
+        // no map is built at all.
+        if self.marks.is_empty() {
+            return false;
+        }
+        // Keyed once for the tick rather than scanned per row: the window hands
+        // in every shown row, so looking each one up across all the marks was
+        // rows × marks every 16 ms. Two rows can share a key — the same agent
+        // name in one checkout, in two panes — so a repeat is kept rather than
+        // overwriting the first: either of them may be the one that needs a look.
+        let mut states: HashMap<&Key, State> = HashMap::new();
+        let mut repeated: Vec<(&Key, State)> = Vec::new();
         for (key, state) in rows {
-            let Some(mark) = self.marks.iter_mut().find(|mark| mark.key == *key) else {
+            match states.entry(key) {
+                Entry::Vacant(slot) => {
+                    slot.insert(state);
+                }
+                Entry::Occupied(_) => repeated.push((key, state)),
+            }
+        }
+        let mut changed = false;
+        for mark in &mut self.marks {
+            let Some(&state) = states.get(&mark.key) else {
                 continue;
             };
             let Some((hold, _)) = mark.held else {
                 continue;
             };
-            if mark.hold(state, now).is_none() {
+            let releases = mark.hold(state, now).is_none()
+                || repeated
+                    .iter()
+                    .any(|(key, state)| *key == &mark.key && mark.hold(*state, now).is_none());
+            if releases {
                 mark.held = None;
                 mark.woke = matches!(hold, Hold::Snoozed { .. });
                 changed = true;

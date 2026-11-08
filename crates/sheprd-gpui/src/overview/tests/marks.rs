@@ -98,3 +98,21 @@ fn marks_are_saved_and_read_back() {
     std::fs::write(&path, b"{\"marks\": 3}").unwrap();
     assert!(Marks::at(Some(path)).get(&key("codex")).is_none());
 }
+
+#[test]
+fn two_rows_sharing_a_key_each_get_to_release_the_hold() {
+    let mut marks = Marks::default();
+    let shared = key("claude");
+    marks.snooze(&shared, State::Idle, at(1_000));
+    // One agent name in one checkout can appear in two panes. The first row is
+    // still idle and would keep the snooze; the second turned blocked and ends
+    // it, so a hold released by either one has to clear.
+    assert!(
+        marks.wake([(&shared, State::Idle), (&shared, State::Blocked)], at(0)),
+        "the blocked row should have ended the hold"
+    );
+    assert!(
+        marks.get(&shared).is_some_and(|mark| mark.woke),
+        "the hold outlived a row that needed a look"
+    );
+}
