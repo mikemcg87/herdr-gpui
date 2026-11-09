@@ -19,10 +19,32 @@ fn load(locale: &Locale) -> Option<Catalog> {
 
 /// Bumped whenever the shown catalog changes, so text formatted for the old
 /// locale is not served again. [`super::text`] keeps its answers against this.
+#[cfg(not(test))]
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Tests keep their catalog per thread, so the generation has to follow it:
+/// a sibling test switching locale must not drop text from this thread's cache
+/// between two calls in the same assertion.
+#[cfg(test)]
+thread_local! {
+    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
 pub(super) fn generation() -> u64 {
     GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(super) fn generation() -> u64 {
+    GENERATION.with(std::cell::Cell::get)
+}
+
+fn bump() {
+    #[cfg(not(test))]
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    GENERATION.with(|generation| generation.set(generation.get() + 1));
 }
 
 #[cfg(not(test))]
@@ -63,7 +85,7 @@ pub(super) fn replace(locale: &Locale) {
     if let Ok(mut current) = CURRENT.write() {
         *current = Some(Arc::new(catalog));
     }
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bump();
 }
 
 #[cfg(test)]
@@ -88,5 +110,5 @@ pub(super) fn replace(locale: &Locale) {
     if let Some(catalog) = load(locale) {
         CURRENT.set(Some(Arc::new(catalog)));
     }
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    bump();
 }
